@@ -1,120 +1,173 @@
 # main.py
 import tkinter as tk
 from tkinter import scrolledtext
-import wikipedia
-import pyttsx3
 import threading
-import requests
-from bs4 import BeautifulSoup
+import wikipedia
+from transformers import pipeline
+import re
+import pyttsx3
 
-# ---------------- Voice Function ----------------
+# ---------------- MEMORY ----------------
+context = {
+    "topic": None
+}
+
+user_preferences = {
+    "answer_length": "long",   # long | short
+    "tone": "simple"
+}
+
+# ---------------- TEXT TO SPEECH ----------------
+engine = pyttsx3.init()
+engine.setProperty("rate", 170)
+
 def speak(text):
-    engine = pyttsx3.init()
     engine.say(text)
     engine.runAndWait()
 
-# ---------------- Context Memory ----------------
-context_memory = {}
+# ---------------- SUMMARIZER (LIGHTWEIGHT) ----------------
+summarizer = pipeline(
+    "summarization",
+    model="sshleifer/distilbart-cnn-6-6"
+)
 
-# ---------------- Fetch Wikipedia Info ----------------
-def fetch_wiki_info(query):
-    output_text.config(state='normal')
-    output_text.delete("1.0", tk.END)
-    output_text.insert(tk.END, "Jarvis is fetching information...\n")
-    output_text.config(state='disabled')
-    root.update()
+# ---------------- HELPERS ----------------
+def end_on_sentence(text):
+    if "." in text:
+        return text.rsplit(".", 1)[0] + "."
+    return text
 
+def simplify(text):
+    replacements = {
+        "utilize": "use",
+        "approximately": "about",
+        "demonstrates": "shows",
+        "facilitates": "helps",
+        "numerous": "many",
+        "individuals": "people",
+        "objective": "goal",
+        "methodology": "method"
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    return text
+
+def assistant_tone(text, topic):
+    intro = f"Here’s a clear explanation of {topic}:\n\n"
+    outro = "\n\nIf you want, you can ask for examples, uses, advantages, or future trends."
+    return intro + text + outro
+
+# ---- SAFE TRUNCATION ----
+def safe_truncate(text, max_words=650):
+    words = text.split()
+    return " ".join(words[:max_words])
+
+# ---------------- FOLLOW-UP LOGIC ----------------
+FOLLOW_UP_WORDS = {
+    "applications", "uses", "examples",
+    "advantages", "disadvantages", "future"
+}
+
+def normalize_query(query):
+    q = query.lower().strip()
+    q = re.sub(r"\b(19|20)\d{2}\b", "", q).strip()
+
+    if q in FOLLOW_UP_WORDS and context["topic"]:
+        return f"{context['topic']} {q}"
+
+    if q == "ai":
+        return "Artificial intelligence"
+
+    if "cors" in q:
+        return "Cross-origin resource sharing"
+
+    return query
+
+# ---------------- CORE ASSISTANT ----------------
+def fetch_and_respond(query):
     wikipedia.set_lang("en")
-    try:
-        # Keep previous queries in context
-        context_memory['last_query'] = query
 
-        # Search Wikipedia first
-        results = wikipedia.search(query)
+    try:
+        search_query = normalize_query(query)
+        results = wikipedia.search(search_query)
+
         if not results:
-            msg = "Sorry, no Wikipedia results found."
-            update_gui(msg)
-            speak(msg)
+            reply("Sorry, I couldn’t find useful information on that.")
+            ask_button.config(state="normal")
             return
 
-        # Pick first result
-        article_title = results[0]
-
-        # Fetch summary
         try:
-            summary = wikipedia.summary(article_title, sentences=5)
-            page = wikipedia.page(article_title)
-            url = page.url
+            page = wikipedia.page(results[0])
         except wikipedia.DisambiguationError as e:
-            article_title = e.options[0]
-            summary = wikipedia.summary(article_title, sentences=5)
-            page = wikipedia.page(article_title)
-            url = page.url
+            page = wikipedia.page(e.options[0])
 
-        # Fetch additional snippet from the first paragraph of page HTML
-        additional_text = fetch_additional_snippet(url)
+        context["topic"] = page.title
+        content = page.content
 
-        # Combine summaries for a concise, human-like explanation
-        final_text = f"{summary}\n\n{additional_text}" if additional_text else summary
+        text = safe_truncate(content, max_words=650)
 
-        display_text = f"--- Wikipedia: {url} ---\n\n{final_text}"
-        update_gui(display_text)
-        speak(final_text)
+        if user_preferences["answer_length"] == "long":
+            max_len, min_len = 260, 130
+        else:
+            max_len, min_len = 150, 60
 
-    except wikipedia.PageError:
-        msg = "Sorry, I could not find any page for your query."
-        update_gui(msg)
-        speak(msg)
+        summary = summarizer(
+            text,
+            max_length=max_len,
+            min_length=min_len,
+            do_sample=False
+        )[0]["summary_text"]
+
+        summary = end_on_sentence(simplify(summary))
+        final_answer = assistant_tone(summary, context["topic"])
+
+        reply(final_answer)
+        speak(summary)
 
     except Exception as e:
-        msg = f"An unexpected error occurred: {e}"
-        update_gui(msg)
-        speak(msg)
+        reply(f"An unexpected error occurred: {e}")
 
-# ---------------- Fetch additional snippet from Wikipedia HTML ----------------
-def fetch_additional_snippet(url):
-    try:
-        r = requests.get(url)
-        soup = BeautifulSoup(r.text, "html.parser")
-        content_div = soup.find("div", class_="mw-parser-output")
-        if not content_div:
-            return ""
-        paragraphs = content_div.find_all("p")
-        for p in paragraphs:
-            txt = p.get_text().strip()
-            if txt and len(txt) > 50:
-                return txt
-        return ""
-    except:
-        return ""
+    finally:
+        ask_button.config(state="normal")
 
-# ---------------- Thread-safe GUI update ----------------
-def update_gui(text):
-    output_text.config(state='normal')
-    output_text.delete("1.0", tk.END)
-    output_text.insert(tk.END, text)
-    output_text.config(state='disabled')
-    root.update()
+# ---------------- GUI ----------------
+def reply(text):
+    output_box.config(state="normal")
+    output_box.delete("1.0", tk.END)
+    output_box.insert(tk.END, text)
+    output_box.config(state="disabled")
 
-# ---------------- GUI Callback ----------------
-def on_submit():
-    query = entry.get()
-    thread = threading.Thread(target=fetch_wiki_info, args=(query,))
-    thread.start()
+def on_ask():
+    query = input_box.get().strip()
+    if not query:
+        return
 
-# ---------------- Tkinter GUI ----------------
+    ask_button.config(state="disabled")  # prevent overlap
+    threading.Thread(
+        target=fetch_and_respond,
+        args=(query,),
+        daemon=True
+    ).start()
+
 root = tk.Tk()
-root.title("Enhanced Wikipedia Jarvis")
-root.geometry("850x650")
+root.title("Jarvis – Personal Assistant")
+root.geometry("900x620")
 
-tk.Label(root, text="Ask Jarvis about anything:").pack(pady=5)
-entry = tk.Entry(root, width=80)
-entry.pack(pady=5)
+tk.Label(root, text="Ask Jarvis:").pack(pady=5)
 
-submit_btn = tk.Button(root, text="Ask Jarvis", command=on_submit)
-submit_btn.pack(pady=5)
+input_box = tk.Entry(root, width=85)
+input_box.pack(pady=5)
 
-output_text = scrolledtext.ScrolledText(root, height=35, width=100, state='disabled', wrap='word')
-output_text.pack(pady=10)
+ask_button = tk.Button(root, text="Ask", command=on_ask)
+ask_button.pack(pady=5)
+
+output_box = scrolledtext.ScrolledText(
+    root,
+    height=30,
+    width=105,
+    wrap="word",
+    state="disabled"
+)
+output_box.pack(pady=10)
 
 root.mainloop()
